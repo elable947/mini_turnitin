@@ -1,0 +1,487 @@
+\documentclass[aspectratio=169]{beamer}
+\usetheme{Madrid}
+\usecolortheme{seahorse}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+% ── configuración de listings ──
+\lstset{basicstyle=\footnotesize\ttfamily, breaklines=true, frame=single,
+        numbers=none, showstringspaces=false, tabsize=2}
+
+\title[Mini Turnitin v2]{Mini Turnitin: Sistema Híbrido de Detección de\\Similitud Textual}
+\subtitle{PLN — Escuela de Ciencia de Datos}
+\author{Abel Watt}
+\date{\today}
+
+\begin{document}
+
+% ──────────────────────────────────────────────
+\frame{\titlepage}
+
+% ──────────────────────────────────────────────
+\begin{frame}{Agenda}
+  \tableofcontents
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Introducción}
+% ══════════════════════════════════════════════
+
+\begin{frame}{¿Qué es Mini Turnitin?}
+  \begin{itemize}
+    \item Sistema de detección de similitud textual y plagio académico.
+    \item Arquitectura \textbf{híbrida} que combina:
+      \begin{itemize}
+        \item Análisis léxico (TF-IDF y MinHash).
+        \item Embeddings semánticos (all-MiniLM-L6-v2).
+        \item Búsqueda vectorial aproximada (FAISS).
+        \item Reranking fino (Cross-Encoder).
+        \item Detección de texto generado por IA (GPT-2).
+      \end{itemize}
+    \item Interfaz web con \textbf{Streamlit}, 3 modos de análisis.
+    \item Optimizado para CPU, solo inglés, énfasis en velocidad y bajo consumo de RAM.
+  \end{itemize}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Flujo de procesamiento}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Pipeline general}
+  \centering
+  \footnotesize
+  \begin{enumerate}
+    \item \textbf{Extracción}: PyMuPDF (PDF), python-docx (DOCX), lectura directa (TXT).
+    \item \textbf{Preprocesamiento}: spaCy --- lowercasing, tokenización, stopwords, lematización.
+    \item \textbf{Chunking}: división en fragmentos de $\sim$100 palabras con overlap de 20.
+    \item \textbf{Embeddings}: all-MiniLM-L6-v2 vía ONNX Runtime (384 dimensiones).
+    \item \textbf{Indexación FAISS}: búsqueda de vecinos cercanos con producto interno.
+    \item \textbf{Reranking}: Cross-Encoder para puntuar pares de fragmentos.
+    \item \textbf{Ponderación}:
+          $\text{score} = 0.25 \cdot TFIDF + 0.15 \cdot MinHash + 0.60 \cdot Sem\acute{a}ntico$.
+    \item \textbf{Detección IA}: perplejidad GPT-2 + burstiness de oraciones.
+    \item \textbf{Visualización}: resultados persistentes en \texttt{st.session\_state}.
+  \end{enumerate}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Extracción de texto}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Extracción de documentos}
+  Una función unificada \texttt{extract\_text(path)} maneja los tres formatos:
+  \vspace{0.5em}
+  \begin{center}
+    \begin{tabular}{lcl}
+      \textbf{Formato} & & \textbf{Librería} \\
+      \hline
+      PDF   & $\rightarrow$ & PyMuPDF (\texttt{fitz}) \\
+      DOCX  & $\rightarrow$ & \texttt{python-docx} \\
+      TXT   & $\rightarrow$ & Lectura UTF-8 directa \\
+    \end{tabular}
+  \end{center}
+  \vspace{1em}
+  \texttt{Para los archivos subidos vía Streamlit:}
+  \begin{itemize}
+    \item Se escribe a un archivo temporal.
+    \item Se invoca \texttt{extract\_text} sobre la ruta temporal.
+    \item El texto plano resultante pasa al pipeline de análisis.
+  \end{itemize}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Preprocesamiento con spaCy}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Preprocesamiento NLP}
+  Pipeline de limpieza textual usando \texttt{en\_core\_web\_sm}:
+  \vspace{0.5em}
+  \begin{enumerate}
+    \item \textbf{Minúsculas + normalización}:
+          \[
+          \text{limpio} = \texttt{re.sub(r"[{\char`\^}a-z'{\char`\\}s]", "", text.lower())}
+          \]
+    \item \textbf{Tokenización} con el pipeline de spaCy.
+    \item \textbf{Eliminación de stopwords} (lista integrada de spaCy).
+    \item \textbf{Lematización}: cada token se reduce a su forma canónica.
+  \end{enumerate}
+  \vspace{1em}
+  \textbf{Ejemplo:}
+  \begin{quote}
+    \texttt{"Students are learning NLP and data science"} \\[0.3em]
+    $\rightarrow$ \texttt{[student, learn, nlp, data, science]}
+  \end{quote}
+  Además se expone \texttt{split\_sentences(text)} para segmentación en oraciones.
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Chunking}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Chunking con superposición}
+  \begin{block}{Motivación}
+    Los Transformers tienen un límite de 512 tokens por secuencia. Un documento completo excede ese límite, por lo que se divide en fragmentos.
+  \end{block}
+  \begin{itemize}
+    \item Cada chunk contiene $\sim$100 palabras.
+    \item Se respetan límites de oraciones (no se corta una oración a la mitad).
+    \item \textbf{Overlap de 20 palabras} entre chunks consecutivos para evitar perder similitudes en los bordes del corte.
+  \end{itemize}
+  \vspace{0.5em}
+  \begin{center}
+    \small
+    \texttt{[oración1 oración2 ... oraciónN] $\rightarrow$ [chunk1: orac1..orac5]} \\
+    \texttt{[chunk2: orac5..orac9] \hspace{3.9em}(orac5 repetido por overlap)}
+  \end{center}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{TF-IDF}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Análisis léxico — TF-IDF}
+  \textbf{TF-IDF} (\textit{Term Frequency -- Inverse Document Frequency}) pondera cada término según su frecuencia en el documento y su rareza en el corpus.
+  \vspace{0.5em}
+  \begin{align*}
+    \text{TF}(t, d) &= \frac{f_{t,d}}{\sum_{t' \in d} f_{t',d}} \\[0.5em]
+    \text{IDF}(t, D) &= \log\frac{|D|}{|\{d \in D : t \in d\}|} \\[0.5em]
+    \text{TF-IDF}(t, d, D) &= \text{TF}(t, d) \cdot \text{IDF}(t, D)
+  \end{align*}
+  \vspace{0.5em}
+  \textbf{Implementación:}
+  \begin{itemize}
+    \item \texttt{TfidfVectorizer} de scikit-learn con n-gramas 1--3.
+    \item Similitud coseno entre vectores TF-IDF:
+          \[
+          \text{sim}_{\text{cos}}(A, B) = \frac{A \cdot B}{\|A\| \|B\|}
+          \]
+  \end{itemize}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{MinHash}
+% ══════════════════════════════════════════════
+
+\begin{frame}{MinHash — Near-duplicates}
+  \textbf{MinHash} estima la similitud de Jaccard entre dos conjuntos de tokens sin necesidad de calcular la intersección exacta.
+  \vspace{0.5em}
+  \begin{align*}
+    J(A, B) &= \frac{|A \cap B|}{|A \cup B|} \\[0.5em]
+    P[\min(\pi(A)) = \min(\pi(B))] &= J(A, B)
+  \end{align*}
+  donde $\pi$ es una permutación aleatoria del universo de tokens.
+  \vspace{0.5em}
+  \begin{itemize}
+    \item Se usan $k = 128$ permutaciones independientes (firma de 128 enteros).
+    \item La similitud estimada es la fracción de firmas que coinciden:
+          \[
+          \hat{J}(A, B) = \frac{1}{k} \sum_{i=1}^{k} \mathbf{1}[\min(\pi_i(A)) = \min(\pi_i(B))]
+          \]
+    \item Eficaz para detectar \textit{``copy-paste''} y paráfrasis cercanas.
+  \end{itemize}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Embeddings semánticos}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Embeddings semánticos (all-MiniLM-L6-v2)}
+  \begin{block}{Modelo}
+    \texttt{sentence-transformers/all-MiniLM-L6-v2}: Transformer de 6 capas que produce vectores de 384 dimensiones. Optimizado para similitud semántica en inglés.
+  \end{block}
+  \vspace{0.3em}
+  \textbf{Arquitectura:}
+  \[
+  \text{texto} \xrightarrow{\text{BERT}} [h_{\text{[CLS]}}, h_1, \dots, h_n] \xrightarrow{\text{mean pooling}} \mathbf{v} \in \mathbb{R}^{384}
+  \]
+  \vspace{0.3em}
+  \textbf{Optimizaciones:}
+  \begin{itemize}
+    \item \textbf{ONNX Runtime}: exporta el modelo a formato ONNX; inferencia 2--3$\times$ más rápida en CPU.
+    \item \textbf{Batching}: múltiples chunks en un lote (batch\_size=64).
+    \item \textbf{Cache}: \texttt{diskcache} con clave SHA256(texto):modelo evita recomputar.
+    \item \textbf{Carga lazy}: el modelo se carga en memoria solo en la primera llamada.
+  \end{itemize}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{FAISS}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Búsqueda vectorial con FAISS}
+  \textbf{Facebook AI Similarity Search (FAISS)}: biblioteca para búsqueda aproximada de vecinos cercanos en espacios vectoriales de alta dimensión.
+  \vspace{0.5em}
+  \begin{block}{Índice: \texttt{IndexFlatIP}}
+    Producto interno con normalización L2 de los vectores, equivalente a similitud coseno:
+    \[
+    \text{sim}_{\text{cos}}(q, x) = \frac{q \cdot x}{\|q\| \|x\|} \quad\text{donde}\quad \|q\| = \|x\| = 1
+    \]
+    \[
+    \text{FAISS busca: } \arg\max_{x \in \mathcal{D}} \langle q, x \rangle
+    \]
+  \end{block}
+  \vspace{0.3em}
+  \textbf{Proceso:}
+  \begin{enumerate}
+    \item Se indexan todos los chunks del documento B (o del corpus) como vectores de 384d.
+    \item Cada chunk del documento A se usa como query.
+    \item FAISS retorna los top-$k$ chunks más similares ($k=5$).
+  \end{enumerate}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Cross-Encoder}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Reranking con Cross-Encoder}
+  Los embeddings independientes (bi-encoder) pierden información de la interacción entre textos. El \textbf{Cross-Encoder} procesa ambos textos simultáneamente.
+  \vspace{0.5em}
+  \begin{center}
+    \texttt{[CLS] texto A [SEP] texto B [SEP]} \\
+    $\downarrow$ \\
+    Transformer (cross-encoder/stsb-MiniLM-L6-v2) \\
+    $\downarrow$ \\
+    \texttt{[CLS] $\rightarrow$ FFN $\rightarrow$ score $\in [0, 1]$}
+  \end{center}
+  \vspace{0.5em}
+  \textbf{Ventaja:} captura relaciones semánticas finas que el producto interno de vectores independientes no detecta. Aunque es más costoso, solo se aplica a los $k$ candidatos preseleccionados por FAISS.
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Ponderación}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Score ponderado final}
+  Las tres métricas se combinan en un score global:
+  \[
+  \boxed{\text{score}_{\text{final}} = 0.25 \cdot s_{\text{tfidf}} + 0.15 \cdot s_{\text{minhash}} + 0.60 \cdot s_{\text{sem}}}
+  \]
+  \vspace{0.5em}
+  \begin{center}
+    \begin{tabular}{lcc}
+      \textbf{Componente} & \textbf{Peso} & \textbf{Rol} \\
+      \hline
+      TF-IDF ($s_{\text{tfidf}}$)    & 0.25 & Coincidencia léxica exacta (ngramas) \\
+      MinHash ($s_{\text{minhash}}$) & 0.15 & Cercanía de conjuntos de tokens \\
+      Semántico ($s_{\text{sem}}$)   & 0.60 & Similitud de significado \\
+      \hline
+    \end{tabular}
+  \end{center}
+  \vspace{0.5em}
+  \textbf{Niveles de alerta:}
+  \[
+  \begin{cases}
+    \text{score} > 0.75 & \text{Alto (rojo)} \\
+    0.45 \leq \text{score} \leq 0.75 & \text{Medio (naranja)} \\
+    \text{score} < 0.45 & \text{Bajo (verde)}
+  \end{cases}
+  \]
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Detección de IA}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Detección de texto generado por IA}
+  \textbf{Dos métricas} basadas en GPT-2:
+  \vspace{0.5em}
+  \begin{description}
+    \item[Perplejidad] Mide qué tan ``sorprendido'' está el modelo por el texto:
+          \[
+          \text{PPL}(X) = \exp\left(-\frac{1}{N}\sum_{i=1}^{N} \log P(x_i \mid x_{<i})\right)
+          \]
+          Textos de IA tienen perplejidad más baja (son más predecibles).
+
+    \item[Burstiness] Coeficiente de variación de longitudes de oraciones:
+          \[
+          B = \frac{\sigma_{\text{longitudes}}}{\mu_{\text{longitudes}}}
+          \]
+          Textos de IA tienen burstiness más baja (oraciones de largo uniforme).
+  \end{description}
+  \vspace{0.5em}
+  \[
+  \boxed{\text{score}_{\text{IA}} = \left(1 - \frac{\text{PPL}}{200}\right) \cdot 0.6 + (1 - B) \cdot 0.4}
+  \]
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Orquestación en Streamlit}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Orquestación — \texttt{app/services/analyzer.py}}
+  \textbf{\texttt{analyze(doc1, doc2)}}
+  \begin{enumerate}
+    \item Preprocesa ambos documentos (spaCy).
+    \item Chunking ($\sim$100 palabras, overlap 20).
+    \item Embeddings por chunk con cache.
+    \item Indexa chunks del doc2 en FAISS.
+    \item Busca cada chunk del doc1 contra el índice.
+    \item Reranking con Cross-Encoder sobre candidatos.
+    \item Score semántico global (embedding del doc completo).
+    \item Detección IA sobre doc1.
+    \item Score final ponderado.
+  \end{enumerate}
+  \vspace{0.5em}
+  \textbf{\texttt{analyze\_corpus(doc, corpus\_dir)}}
+  \begin{enumerate}
+    \item Carga los 34 PDFs del corpus en paralelo.
+    \item Indexa todos los chunks en FAISS.
+    \item Busca chunks del query, agrega hits por documento.
+    \item TF-IDF + MinHash por documento.
+    \item Ranking descendente con score ponderado + detección IA.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Interfaz de usuario — \texttt{app.py}}
+  \textbf{3 modos de análisis} seleccionables con radio horizontal:
+  \vspace{0.5em}
+  \begin{center}
+    \begin{tabular}{lp{8cm}}
+      \textbf{Modo} & \textbf{Qué hace} \\
+      \hline
+      Comparar dos documentos & Análisis pairwise con fragmentos similares \\
+      Comparar contra corpus  & Documento vs 34 PDFs académicos \\
+      Detectar IA            & GPT-2 perplejidad + burstiness \\
+    \end{tabular}
+  \end{center}
+  \vspace{1em}
+  \textbf{Persistencia con session state:}
+  \begin{itemize}
+    \item Los resultados se almacenan en \texttt{st.session\_state} con claves como \texttt{result\_2doc}, \texttt{result\_corpus}, \texttt{result\_ia}.
+    \item El modo activo se guarda en \texttt{st.session\_state.last\_mode}.
+    \item Los datos sobreviven a cualquier rerun de Streamlit (widgets, botones, etc.).
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Diagrama de orquestación}
+  \centering
+  \footnotesize
+  \begin{verbatim}
+  Streamlit (app.py)
+      │
+      ├── Modo: "Comparar dos documentos"
+      │     → analyze(doc1, doc2)
+      │       → preprocess() → chunk() → embed() → FAISS
+      │       → rerank() → lexical() → IA detect → score()
+      │
+      ├── Modo: "Comparar contra corpus"
+      │     → analyze_corpus(doc, corpus_dir)
+      │       → load_corpus() → index_corpus() → search()
+      │       → lexical_per_doc() → rank() → IA detect
+      │
+      └── Modo: "Detectar IA"
+            → ai_probability(text)
+              → GPT-2 pipeline → perplexity + burstiness
+  \end{verbatim}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Optimizaciones}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Optimizaciones clave}
+  \begin{center}
+    \small
+    \begin{tabular}{p{4cm}p{7cm}}
+      \textbf{Técnica} & \textbf{Problema que resuelve} \\
+      \hline
+      Chunking + overlap & Límite de 512 tokens del Transformer \\
+      FAISS IndexFlatIP  & Búsqueda O($\log n$) en lugar de O($n\cdot m$) \\
+      ONNX Runtime       & Inferencia 2--3$\times$ más rápida en CPU \\
+      diskcache          & Evita recalcular embeddings entre ejecuciones \\
+      Batching (bs=64)   & Reduce overhead de llamadas al modelo \\
+      Cross-Encoder      & Mayor precisión en fragmentos candidatos \\
+      Carga lazy         & Modelos se cargan solo al primer uso \\
+      Session state      & Resultados persisten ante reruns de Streamlit \\
+      Config centralizada & Todos los parámetros en un dataclass \\
+    \end{tabular}
+  \end{center}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Ejecución}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Cómo ejecutar}
+  \begin{block}{Requisitos}
+    Python 3.12+, entorno virtual con \texttt{uv}.
+  \end{block}
+  \vspace{0.5em}
+  \begin{lstlisting}[language=bash]
+# Crear entorno virtual e instalar dependencias
+uv sync
+
+# Lanzar la aplicación
+streamlit run app.py
+  \end{lstlisting}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Tecnologías}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Stack tecnológico}
+  \begin{center}
+    \small
+    \begin{tabular}{lp{8cm}}
+      \textbf{Librería} & \textbf{Propósito} \\
+      \hline
+      spaCy         & Tokenización, lematización, sentence splitting \\
+      scikit-learn  & TF-IDF Vectorizer + similitud coseno \\
+      datasketch    & MinHash (128 permutaciones) \\
+      sentence-transformers & all-MiniLM-L6-v2 (384d) \\
+      faiss-cpu     & Búsqueda ANN (IndexFlatIP) \\
+      onnxruntime + optimum & Aceleración de inferencia en CPU \\
+      diskcache     & Cache persistente de embeddings \\
+      polars        & Procesamiento eficiente de resultados \\
+      PyMuPDF       & Extracción de texto de PDFs \\
+      python-docx   & Extracción de texto de DOCX \\
+      streamlit     & Interfaz de usuario web \\
+      tqdm          & Barras de progreso \\
+    \end{tabular}
+  \end{center}
+\end{frame}
+
+% ══════════════════════════════════════════════
+\section{Trabajo futuro}
+% ══════════════════════════════════════════════
+
+\begin{frame}{Limitaciones y trabajo futuro}
+  \begin{block}{Limitaciones actuales}
+    \begin{itemize}
+      \item Solo inglés (all-MiniLM-L6-v2 no es multilingüe).
+      \item ONNX export requiere $\sim$2 min en primera ejecución.
+      \item TF-IDF no captura paráfrasis semánticas (peso bajo, 0.25).
+    \end{itemize}
+  \end{block}
+  \vspace{0.5em}
+  \begin{block}{Posibles mejoras}
+    \begin{itemize}
+      \item Soporte multilingüe (e.g., paraphrase-multilingual-MiniLM-L12-v2).
+      \item Modelo de IA más grande (GPT-2 Medium, LLaMA) para mejor detección.
+      \item Despliegue en la nube (Streamlit Cloud, Hugging Face Spaces).
+      \item Base de datos vectorial (ChromaDB, Qdrant) en lugar de FAISS en memoria.
+      \item Autenticación multi-usuario con historial de análisis.
+    \end{itemize}
+  \end{block}
+\end{frame}
+
+% ──────────────────────────────────────────────
+\begin{frame}
+  \centering
+  \vfill
+  {\Huge ¡Gracias!}
+  \vfill
+  \begin{itemize}
+    \item Código: \url{https://github.com/abelwatt/mini_turnitin}
+    \item Contacto: Abel Watt
+  \end{itemize}
+  \vfill
+\end{frame}
+
+\end{document}

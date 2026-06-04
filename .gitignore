@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Project caches
+cache/
+onnx/
+
+# Dev / docs
+notebooks/
+avance_/
+*.ipynb
+
+# Env / secrets
+.env
+.streamlit/secrets.toml
+
+# Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Opencode
+.agents/
+skills-lock.json
