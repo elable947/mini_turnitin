@@ -199,7 +199,16 @@ elif ":material/library_books:" in modo:
                 f"{'🔴' if pct > 75 else '🟡' if pct > 45 else '🟢'} "
                 f"`{doc_name[:50]}` — {pct:.1f}% {badge}"
             ):
-                if ruta:
+                if ruta and Path(ruta).exists():
+                    with open(ruta, "rb") as fh:
+                        st.download_button(
+                            label=f":material/download: Descargar {Path(ruta).name}",
+                            data=fh,
+                            file_name=Path(ruta).name,
+                            mime="application/pdf" if ruta.endswith(".pdf") else None,
+                            use_container_width=True,
+                        )
+                elif ruta:
                     st.markdown(f":material/folder_open: **Ruta:** `{ruta}`")
                 mostrar_resultado(r, titulo=None)
 
